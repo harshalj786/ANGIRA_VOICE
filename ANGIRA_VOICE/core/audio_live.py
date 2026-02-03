@@ -24,6 +24,7 @@ from config.constants import (
     MAX_AUDIO_DURATION,
     GEMINI_LIVE_MODEL,
     WAKE_WORD,
+    REASONING_SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,36 @@ class AudioLiveHandler:
     def _calculate_rms(self, audio_data: bytes) -> float:
         """Calculate RMS (root mean square) of audio chunk for silence detection."""
         try:
+            samples = struct.unpack(f"{len(audio_data)//2}h", audio_data)
+            rms = np.sqrt(np.mean(np.square(np.array(samples, dtype=np.float32))))
+            return rms / 32768.0  # Normalize to 0-1 range
+        except Exception:
+            return 0.0
+
+    def _calculate_energy_features(self, audio_data: bytes, prev_rms: float = 0.0) -> tuple[float, float, float]:
+        """
+        Calculate multiple energy features for aggressive speech detection.
+        
+        Returns:
+            Tuple of (rms, zero_crossing_rate, energy_delta)
+        """
+        try:
+            samples = struct.unpack(f"{len(audio_data)//2}h", audio_data)
+            samples_array = np.array(samples, dtype=np.float32)
+            
+            # RMS
+            rms = np.sqrt(np.mean(np.square(samples_array))) / 32768.0
+            
+            # Zero-crossing rate (normalized)
+            zero_crossings = np.sum(np.abs(np.diff(np.sign(samples_array)))) / 2
+            zcr = zero_crossings / len(samples_array)
+            
+            # Energy delta (spike detection)
+            energy_delta = abs(rms - prev_rms)
+            
+            return rms, zcr, energy_delta
+        except Exception:
+            return 0.0, 0.0, 0.0
             samples = struct.unpack(f"{len(audio_data)//2}h", audio_data)
             rms = np.sqrt(np.mean(np.square(np.array(samples, dtype=np.float32))))
             return rms / 32768.0  # Normalize to 0-1 range
@@ -481,6 +512,314 @@ class AudioLiveHandler:
         logger.info(f"Assistant replied: {assistant_text[:100]}...")
         
         return user_text, assistant_text
+
+    async def stream_conversation(
+        self,
+        on_transcription: Optional[Callable[[str], None]] = None,
+        on_response_text: Optional[Callable[[str], None]] = None,
+        on_interrupted: Optional[Callable[[], None]] = None,
+    ) -> tuple[str, str, bool]:
+        """
+        Ultra-low latency streaming conversation with <100ms interruption detection.
+        
+        Architecture:
+        1. Single mic capture task pushes to shared queue
+        2. Gemini streaming consumes from queue (1024-frame chunks)
+        3. Interruption detector consumes from queue (256-frame windows)
+        4. Hard audio flush on interruption for instant silence
+        
+        Args:
+            on_transcription: Callback when user transcription is available.
+            on_response_text: Callback when response text chunks arrive.
+            on_interrupted: Callback when user interrupts the response.
+            
+        Returns:
+            Tuple of (user_transcription, assistant_response_text, was_interrupted).
+        """
+        logger.info("Starting streaming conversation (ultra-low latency mode)...")
+        
+        # Shorter system prompt for Live API compatibility
+        short_system_prompt = (
+            "You are Angira, a JEE doubt-solving voice assistant. "
+            "Speak clearly and concisely. Explain concepts step by step. "
+            "Use verbal math descriptions like 'x squared' instead of 'x^2'. "
+            "Be patient and teacher-like. Never be condescending."
+        )
+        
+        config = {
+            "response_modalities": ["AUDIO"],
+            "system_instruction": short_system_prompt,
+        }
+        
+        # Shared state
+        user_text = ""
+        assistant_text = ""
+        was_interrupted = False
+        prev_rms = 0.0
+        
+        # Events for coordination
+        interrupt_detected = asyncio.Event()
+        response_complete = asyncio.Event()
+        send_complete = asyncio.Event()
+        playback_started = asyncio.Event()
+        
+        # Shared audio queue for single-reader architecture
+        # Small chunks (256 frames = 16ms) for fast interruption detection
+        INTERRUPT_CHUNK_SIZE = 256
+        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+        
+        async with self.client.aio.live.connect(
+            model=GEMINI_LIVE_MODEL,
+            config=config
+        ) as session:
+            # Open streams
+            input_stream = await asyncio.to_thread(self._open_input_stream)
+            output_stream = await asyncio.to_thread(self._open_output_stream)
+            
+            try:
+                async def mic_capture():
+                    """
+                    SINGLE microphone reader - pushes ALL audio to shared queue.
+                    This is the ONLY task that reads from input_stream.
+                    """
+                    logger.debug("Mic capture started (single reader)")
+                    
+                    while not response_complete.is_set() or not send_complete.is_set():
+                        try:
+                            # Read smaller chunks for faster interruption detection
+                            data = await asyncio.to_thread(
+                                input_stream.read,
+                                INTERRUPT_CHUNK_SIZE,
+                                exception_on_overflow=False
+                            )
+                            
+                            # Non-blocking put - drop frames if queue is full
+                            try:
+                                audio_queue.put_nowait(data)
+                            except asyncio.QueueFull:
+                                pass  # Drop frame rather than block
+                                
+                        except Exception as e:
+                            logger.warning(f"Mic capture error: {e}")
+                            break
+                    
+                    logger.debug("Mic capture ended")
+                
+                async def send_audio():
+                    """Stream audio to Gemini - consumes from shared queue."""
+                    nonlocal user_text
+                    silence_count = 0
+                    max_silence = int(SILENCE_DURATION * self.config.input_rate / INTERRUPT_CHUNK_SIZE)
+                    has_speech = False
+                    audio_buffer = b""
+                    
+                    logger.debug("Audio send loop started")
+                    
+                    while True:
+                        try:
+                            # Get audio from shared queue with timeout
+                            try:
+                                data = await asyncio.wait_for(
+                                    audio_queue.get(), 
+                                    timeout=0.1
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                            
+                            # Accumulate small chunks into larger buffer for Gemini
+                            audio_buffer += data
+                            
+                            rms = self._calculate_rms(data)
+                            if rms > SILENCE_THRESHOLD:
+                                has_speech = True
+                                silence_count = 0
+                            else:
+                                silence_count += 1
+                            
+                            # Send to Gemini when we have enough data (1024 frames worth)
+                            if len(audio_buffer) >= self.config.chunk_size * 2:  # 2 bytes per sample
+                                await session.send_realtime_input(
+                                    audio={"data": audio_buffer, "mime_type": "audio/pcm"}
+                                )
+                                audio_buffer = b""
+                            
+                            # Stop after detecting end of speech
+                            if has_speech and silence_count >= max_silence:
+                                # Send any remaining buffer
+                                if audio_buffer:
+                                    await session.send_realtime_input(
+                                        audio={"data": audio_buffer, "mime_type": "audio/pcm"}
+                                    )
+                                logger.debug("End of speech detected")
+                                break
+                                
+                        except Exception as e:
+                            logger.warning(f"Audio send error: {e}")
+                            break
+                    
+                    send_complete.set()
+                    logger.debug("Audio send complete")
+                
+                async def monitor_interruption():
+                    """
+                    Aggressive interruption detection with <100ms latency.
+                    Uses energy spike detection, not conservative VAD.
+                    """
+                    nonlocal was_interrupted, prev_rms
+                    
+                    # Wait for playback to start
+                    try:
+                        await asyncio.wait_for(playback_started.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        return
+                    
+                    if response_complete.is_set():
+                        return
+                    
+                    logger.debug("Interruption monitor active")
+                    
+                    # Aggressive detection thresholds
+                    ENERGY_SPIKE_THRESHOLD = 0.008  # Sudden energy increase
+                    ZCR_SPIKE_THRESHOLD = 0.15      # Voice typically has higher ZCR
+                    RMS_THRESHOLD = SILENCE_THRESHOLD * 1.0  # Lowered for sensitivity
+                    
+                    while not response_complete.is_set():
+                        try:
+                            # Get audio from shared queue (non-blocking peek equivalent)
+                            try:
+                                data = await asyncio.wait_for(
+                                    audio_queue.get(),
+                                    timeout=0.02  # 20ms timeout for responsiveness
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                            
+                            # Calculate multiple features for aggressive detection
+                            rms, zcr, energy_delta = self._calculate_energy_features(data, prev_rms)
+                            prev_rms = rms
+                            
+                            # AGGRESSIVE: Trigger on ANY of these conditions
+                            is_interrupt = (
+                                rms > RMS_THRESHOLD or           # Basic energy threshold
+                                energy_delta > ENERGY_SPIKE_THRESHOLD or  # Sudden spike
+                                (zcr > ZCR_SPIKE_THRESHOLD and rms > RMS_THRESHOLD * 0.5)  # Voice-like
+                            )
+                            
+                            if is_interrupt:
+                                logger.info(f"INTERRUPT! RMS={rms:.4f}, ZCR={zcr:.3f}, Delta={energy_delta:.4f}")
+                                was_interrupted = True
+                                interrupt_detected.set()
+                                
+                                # HARD FLUSH: Stop speaker immediately
+                                try:
+                                    output_stream.stop_stream()
+                                    output_stream.start_stream()
+                                except Exception as e:
+                                    logger.warning(f"Flush error: {e}")
+                                
+                                if on_interrupted:
+                                    on_interrupted()
+                                break
+                                
+                        except Exception as e:
+                            logger.warning(f"Interruption monitor error: {e}")
+                            break
+                    
+                    logger.debug("Interruption monitor ended")
+                
+                async def receive_response():
+                    """Receive and play response audio with instant-stop capability."""
+                    nonlocal assistant_text, user_text
+                    
+                    logger.debug("Response receive loop started")
+                    
+                    async for response in session.receive():
+                        # Check for interruption FIRST
+                        if interrupt_detected.is_set():
+                            logger.debug("Response interrupted by user")
+                            break
+                            
+                        try:
+                            if response.server_content:
+                                # Handle input transcription
+                                if response.server_content.input_transcription:
+                                    transcript = response.server_content.input_transcription.text or ""
+                                    if transcript:
+                                        user_text = transcript
+                                        if on_transcription:
+                                            on_transcription(transcript)
+                                
+                                # Handle model response
+                                if response.server_content.model_turn:
+                                    for part in response.server_content.model_turn.parts:
+                                        if interrupt_detected.is_set():
+                                            break
+                                            
+                                        if part.inline_data and part.inline_data.data:
+                                            # Signal that playback has started
+                                            if not playback_started.is_set():
+                                                playback_started.set()
+                                                logger.debug("Playback started")
+                                            
+                                            # Check interrupt before EVERY write
+                                            if not interrupt_detected.is_set():
+                                                await asyncio.to_thread(
+                                                    output_stream.write,
+                                                    part.inline_data.data
+                                                )
+                                        
+                                        if part.text:
+                                            assistant_text += part.text
+                                            if on_response_text:
+                                                on_response_text(part.text)
+                                
+                                if response.server_content.turn_complete:
+                                    logger.debug("Turn complete")
+                                    break
+                                    
+                        except Exception as e:
+                            logger.warning(f"Response receive error: {e}")
+                            break
+                    
+                    response_complete.set()
+                    logger.debug("Response receive complete")
+                
+                # Run all tasks concurrently
+                await asyncio.gather(
+                    mic_capture(),
+                    send_audio(),
+                    receive_response(),
+                    monitor_interruption(),
+                    return_exceptions=True
+                )
+                
+            finally:
+                # Clean shutdown
+                try:
+                    input_stream.stop_stream()
+                    input_stream.close()
+                except Exception:
+                    pass
+                    
+                try:
+                    output_stream.stop_stream()
+                    output_stream.close()
+                except Exception:
+                    pass
+                    
+                # Clear queue
+                while not audio_queue.empty():
+                    try:
+                        audio_queue.get_nowait()
+                    except:
+                        break
+                
+                # Brief delay for audio device reset
+                await asyncio.sleep(0.05)
+        
+        logger.info(f"Conversation complete - User: '{user_text[:50] if user_text else ''}...', Response: {len(assistant_text)} chars, Interrupted: {was_interrupted}")
+        
+        return user_text, assistant_text, was_interrupted
 
     def play_audio_sync(self, audio_data: bytes, sample_rate: int = OUTPUT_SAMPLE_RATE) -> None:
         """

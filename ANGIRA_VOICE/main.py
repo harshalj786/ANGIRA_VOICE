@@ -74,64 +74,71 @@ class AgniraApp:
     async def _run_audio_mode(self) -> None:
         """Run in real audio mode with microphone and speakers."""
         try:
-            logger.info("Starting Angira in AUDIO mode")
+            logger.info("Starting Angira in AUDIO mode (streaming)")
             print("\n" + "=" * 80)
-            print("ANGIRA VOICE ASSISTANT - AUDIO MODE")
+            print("ANGIRA VOICE ASSISTANT - STREAMING MODE")
             print("=" * 80)
             print(f"Model: {self.audio_handler.get_model_info()['model']}")
-            print("Listening for wake word 'Angira'...")
-            print("Say 'Angira' to start, then ask your question.")
+            print("🚀 Ultra-low latency mode: Response starts as you speak!")
+            print("💡 You can interrupt Angira anytime by speaking!")
+            print("Speak your question directly (no wake word needed).")
             print("Press Ctrl+C to exit\n")
 
             while self.running:
                 try:
-                    # Wait for wake word
-                    print("\n🎤 Listening for 'Angira'...")
-                    logger.info("Waiting for wake word...")
+                    # Streaming mode - audio → reasoning → TTS all in one stream
+                    print("\n🎤 Listening... Speak your question now!")
+                    logger.info("Starting streaming conversation...")
                     
-                    wake_detected = await self.audio_handler.listen_for_wake_word(timeout=10.0)
+                    user_text = ""
+                    response_text = ""
+                    was_interrupted = False
                     
-                    if wake_detected:
-                        logger.info("Wake word detected!")
-                        print("\n✓ Wake word detected! Listening for your question...")
-                        
-                        # Acknowledge wake word detection
-                        await self.audio_handler.speak_text("Yes?")
-                        
-                        # Capture user's question
-                        audio_data = await self.audio_handler.capture_audio_until_silence()
-                        
-                        if len(audio_data) > 1000:  # Minimum audio length
-                            # Transcribe
-                            print("📝 Transcribing...")
-                            transcription = await self.audio_handler.transcribe_audio(audio_data)
-                            
-                            if transcription and len(transcription.strip()) > 0:
-                                print(f"\n🗣️ You said: \"{transcription}\"")
-                                
-                                # Process through pipeline (sync)
-                                logger.info(f"Processing: {transcription}")
-                                result = self.pipeline.process_text(transcription)
-                                
-                                if result and result.response:
-                                    # Route response with async TTS
-                                    await route_response_async(
-                                        result.intent, 
-                                        result.response,
-                                        self.audio_handler
-                                    )
-                                    
-                                print("\n" + "-" * 80)
-                            else:
-                                print("❌ Couldn't understand. Please try again.")
+                    def on_transcription(text: str):
+                        nonlocal user_text
+                        user_text = text
+                        print(f"\r🗣️ You: \"{text}\"", end="", flush=True)
+                    
+                    def on_response_chunk(chunk: str):
+                        nonlocal response_text
+                        response_text += chunk
+                        # Print response as it streams
+                        if len(response_text) == len(chunk):
+                            print(f"\n\n💬 Angira: {chunk}", end="", flush=True)
                         else:
-                            print("❌ No speech detected. Please try again.")
+                            print(chunk, end="", flush=True)
+                    
+                    def on_interrupted():
+                        print("\n\n⚡ [Interrupted by user]", flush=True)
+                    
+                    # Use streaming conversation for ultra-low latency
+                    user_text, response_text, was_interrupted = await self.audio_handler.stream_conversation(
+                        on_transcription=on_transcription,
+                        on_response_text=on_response_chunk,
+                        on_interrupted=on_interrupted,
+                    )
+                    
+                    if was_interrupted:
+                        print("\n[Response was interrupted - ready for your next question]")
+                        logger.info(f"Conversation interrupted - partial response: {len(response_text)} chars")
+                    elif user_text and response_text:
+                        print("\n")  # New line after streaming output
+                        print("\n" + "=" * 80)
+                        print("FULL RESPONSE:")
+                        print("=" * 80)
+                        print(response_text)
+                        print("=" * 80)
+                        logger.info(f"Conversation complete - User: '{user_text[:50]}', Response: {len(response_text)} chars")
+                    elif not user_text:
+                        print("\n❌ No speech detected. Please try again.")
+                    
+                    print("\n" + "-" * 80)
                     
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
-                    logger.error(f"Error in audio loop: {e}", exc_info=True)
-                    print(f"Error: {e}")
+                    logger.error(f"Error in streaming loop: {e}", exc_info=True)
+                    print(f"\nError: {e}")
                     continue
 
         except Exception as e:
